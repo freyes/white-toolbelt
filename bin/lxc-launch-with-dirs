@@ -1,0 +1,112 @@
+#!/bin/bash -e
+
+print_usage() {
+	cat <<'EOF'
+Usage: lxd-launch-with-dirs.sh [--vm] [-t TYPE|--type TYPE] [-c N|--cpus N] [-m N|--mem N] IMAGE NAME
+
+Options:
+	--vm	Create the instance as a virtual machine.
+	-t, --type	Set instance type passed to lxc init.
+	-c, --cpus	Set CPU limit passed as -c limits.cpu=N.
+	-m, --mem	Set memory limit passed as -c limits.memory=NGiB.
+	-d, --disk-size	Set VM root disk size in GiB (default: 20).
+	-h, --help	Show this help text.
+EOF
+}
+
+LXC_OPTS=()
+IS_VM=false
+DISK_SIZE=20
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-h|--help)
+			print_usage
+			exit 0
+			;;
+		--vm)
+			LXC_OPTS+=("--vm")
+			IS_VM=true
+			shift
+			;;
+		-t|--type)
+			if [[ -z "$2" || "$2" == -* ]]; then
+				echo "Error: $1 requires a value" >&2
+				print_usage
+				exit 1
+			fi
+			LXC_OPTS+=("--type" "$2")
+			shift 2
+			;;
+		-c|--cpus)
+			if [[ -z "$2" || "$2" == -* ]]; then
+				echo "Error: $1 requires a value" >&2
+				print_usage
+				exit 1
+			fi
+			if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+				echo "Error: $1 value must be a non-negative integer" >&2
+				exit 1
+			fi
+			LXC_OPTS+=("-c" "limits.cpu=$2")
+			shift 2
+			;;
+		-m|--mem)
+			if [[ -z "$2" || "$2" == -* ]]; then
+				echo "Error: $1 requires a value" >&2
+				print_usage
+				exit 1
+			fi
+			if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+				echo "Error: $1 value must be a non-negative integer" >&2
+				exit 1
+			fi
+			LXC_OPTS+=("-c" "limits.memory=${2}GiB")
+			shift 2
+			;;
+		-d|--disk-size)
+			if [[ -z "$2" || "$2" == -* ]]; then
+				echo "Error: $1 requires a value" >&2
+				print_usage
+				exit 1
+			fi
+			if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+				echo "Error: $1 value must be a non-negative integer" >&2
+				exit 1
+			fi
+			DISK_SIZE="$2"
+			shift 2
+			;;
+		--)
+			shift
+			break
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+if [[ $# -lt 2 ]]; then
+	print_usage
+	exit 0
+fi
+
+IMAGE="$1"
+NAME="$2"
+
+if $IS_VM; then
+	LXC_OPTS+=("-d" "root,size=${DISK_SIZE}GiB")
+fi
+
+lxc init "${LXC_OPTS[@]}" "$IMAGE" "$NAME"
+
+if ! $IS_VM; then
+	lxc config set "$NAME" security.idmap.isolated true
+	lxc config set "$NAME" security.idmap.size 65536 # Or a suitable size
+fi
+
+printf "uid $(id -u) 1000\ngid $(id -g) 1000" | lxc config set "$NAME" raw.idmap -
+
+lxc config device add "$NAME" Projects disk source="$HOME/Projects" path=/src/Projects
+lxc start "$NAME"

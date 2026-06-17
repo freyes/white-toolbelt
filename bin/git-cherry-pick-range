@@ -1,0 +1,163 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 white-toolbelt contributors
+# Cherry-pick a range of commits with sign-off and reference to original commit
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: $0 [OPTIONS] [FIRST] [LAST]" >&2
+    echo "       $0 --pr <NUMBER> [OPTIONS]" >&2
+    echo "" >&2
+    echo "Options:" >&2
+    echo "  --pr <NUMBER>              Cherry-pick commits from a GitHub PR" >&2
+    echo "  --signoff, -s              Add Signed-off-by trailer (default)" >&2
+    echo "  --no-signoff               Don't add Signed-off-by trailer" >&2
+    echo "  -S[<keyid>]                GPG sign commits with optional key ID" >&2
+    echo "  --gpg-sign[=<keyid>]       GPG sign commits with optional key ID" >&2
+    echo "  --no-gpg-sign              Don't GPG sign commits" >&2
+    echo "" >&2
+    echo "Arguments:" >&2
+    echo "  FIRST LAST                 Cherry-pick commits from FIRST^ to LAST" >&2
+    echo "" >&2
+    echo "Examples:" >&2
+    echo "  $0 --pr 1234" >&2
+    echo "  $0 --signoff v1.0 v1.1" >&2
+    echo "  $0 --gpg-sign=ABC123 v1.0 v1.1" >&2
+    exit 1
+}
+
+FIRST=""
+LAST=""
+SIGNOFF="--signoff"  # default
+GPG_SIGN=""
+PR_NUMBER=""
+
+# Parse options
+if [[ $# -eq 0 ]]; then
+    usage
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pr)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --pr requires a PR number" >&2
+                usage
+            fi
+            PR_NUMBER="$2"
+            shift 2
+            ;;
+        --signoff|-s)
+            SIGNOFF="--signoff"
+            shift
+            ;;
+        --no-signoff)
+            SIGNOFF="--no-signoff"
+            shift
+            ;;
+        -S*)
+            # Handle -S or -Skeyid
+            GPG_SIGN="$1"
+            shift
+            ;;
+        --gpg-sign)
+            GPG_SIGN="--gpg-sign"
+            shift
+            ;;
+        --gpg-sign=*)
+            GPG_SIGN="$1"
+            shift
+            ;;
+        --no-gpg-sign)
+            GPG_SIGN="--no-gpg-sign"
+            shift
+            ;;
+        -*)
+            echo "Error: Unknown option '$1'" >&2
+            usage
+            ;;
+        *)
+            # Positional argument
+            if [[ -z "$FIRST" ]]; then
+                FIRST="$1"
+            elif [[ -z "$LAST" ]]; then
+                LAST="$1"
+            else
+                echo "Error: Too many arguments" >&2
+                usage
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate arguments
+if [[ -n "$PR_NUMBER" ]]; then
+    # Using --pr mode
+    if [[ -n "$FIRST" ]] || [[ -n "$LAST" ]]; then
+        echo "Error: Cannot use FIRST/LAST with --pr" >&2
+        usage
+    fi
+    
+    # Check if gh CLI and jq are installed
+    if ! command -v gh &> /dev/null; then
+        echo "Error: 'gh' CLI is required for --pr flag" >&2
+        echo "Install it from: https://cli.github.com/" >&2
+        exit 1
+    fi
+    
+    if ! command -v jq &> /dev/null; then
+        echo "Error: 'jq' is required for --pr flag" >&2
+        echo "Install it using: sudo apt-get install jq" >&2
+        exit 1
+    fi
+    
+    echo "Fetching PR #$PR_NUMBER commits..."
+    
+    # Get PR details and extract base and head commits
+    PR_JSON=$(gh pr view "$PR_NUMBER" --json commits,baseRefName,headRefName 2>/dev/null) || {
+        echo "Error: Could not fetch PR #$PR_NUMBER. Make sure you're in a GitHub repo and have access." >&2
+        exit 1
+    }
+    
+    # Extract the commits from the PR
+    BASE_REF=$(echo "$PR_JSON" | jq -r '.baseRefName')
+    HEAD_REF=$(echo "$PR_JSON" | jq -r '.headRefName')
+    
+    if [[ -z "$BASE_REF" ]] || [[ -z "$HEAD_REF" ]]; then
+        echo "Error: Could not extract branch information from PR #$PR_NUMBER" >&2
+        exit 1
+    fi
+    
+    FIRST="$BASE_REF"
+    LAST="$HEAD_REF"
+    
+    echo "PR #$PR_NUMBER: Cherry-picking from $FIRST to $LAST"
+else
+    # Using FIRST/LAST mode
+    if [[ -z "$FIRST" ]] || [[ -z "$LAST" ]]; then
+        echo "Error: FIRST and LAST are required" >&2
+        usage
+    fi
+fi
+
+# Validate that the commits exist
+if ! git rev-parse "$FIRST" > /dev/null 2>&1; then
+    echo "Error: Invalid commit '$FIRST'" >&2
+    exit 1
+fi
+
+if ! git rev-parse "$LAST" > /dev/null 2>&1; then
+    echo "Error: Invalid commit '$LAST'" >&2
+    exit 1
+fi
+
+# Build git cherry-pick command with options
+CHERRY_PICK_ARGS=(-x "$SIGNOFF")
+if [[ -n "$GPG_SIGN" ]]; then
+    CHERRY_PICK_ARGS+=("$GPG_SIGN")
+fi
+
+echo "Cherry-picking commits from $FIRST^ to $LAST..."
+git cherry-pick "${CHERRY_PICK_ARGS[@]}" $(git rev-list --reverse --no-merges "$FIRST^..$LAST")
