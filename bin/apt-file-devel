@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 white-toolbelt contributors
+
+set -euo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/apt-file"
+
+exec /usr/bin/apt-file -c "${CONF_DIR}/apt-file.devel.conf" "$@"
