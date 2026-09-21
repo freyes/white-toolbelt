@@ -16,7 +16,7 @@ Options:
 EOF
 }
 
-CONFIG_FILE="$HOME/.local/config/lxc-launch-with-dirs.conf"
+CONFIG_FILE="$HOME/.config/lxc-launch-with-dirs.conf"
 LXC_OPTS=()
 PATH_OPTS=()
 USE_DEFAULT_PATHS=true
