@@ -180,3 +180,4 @@ for PATH_SPEC in "${PATH_OPTS[@]}"; do
 done
 
 lxc start "$NAME"
+until lxc exec "$NAME" -- chown ubuntu:ubuntu /home/ubuntu; do sleep 5;done
