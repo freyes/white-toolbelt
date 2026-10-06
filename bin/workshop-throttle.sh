@@ -65,10 +65,10 @@ for project in $(lxc project list -f json | jq -r '.[] | select(.name | test("^w
     for container in $(lxc list --project "$project" -c n --format csv); do
         echo "Processing container: $container"
         if [ "$DISABLE" = true ]; then
-            lxc config unset --project "$project" "$container" limits.memory
-            lxc config unset --project "$project" "$container" limits.cpu
-            lxc config device unset --project "$project" "$container" root limits.read
-            lxc config device unset --project "$project" "$container" root limits.write
+            lxc config unset --project "$project" "$container" limits.memory || /bin/true
+            lxc config unset --project "$project" "$container" limits.cpu || /bin/true
+            lxc config device unset --project "$project" "$container" root limits.read || /bin/true
+            lxc config device unset --project "$project" "$container" root limits.write || /bin/true
         else
             lxc config set --project "$project" "$container" limits.memory ${MAX_MEMORY}
             lxc config set --project "$project" "$container" limits.cpu ${MAX_CPU}
