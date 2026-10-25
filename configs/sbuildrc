@@ -1,0 +1,46 @@
+# *** THIS COMMAND IS DEPRECATED ***
+#
+# In sbuild 0.87.0 and later, the unshare backend is available. This is
+# expected to become the default in a future release.
+#
+# This is the new preferred way of building Debian packages, making the manual
+# creation of schroots no longer necessary. To retain the default behavior,
+# you may remove this comment block and continue.
+#
+# To test the unshare backend while retaining the default settings, run sbuild
+# with --chroot-mode=unshare like this:
+# $ sbuild --chroot-mode=unshare --dist=unstable hello
+#
+# To switch to the unshare backend by default (recommended), uncomment the
+# following lines and delete the rest of the file (with the exception of the
+# last two lines):
+#$chroot_mode = 'unshare';
+$chroot_mode = "unshare";
+$unshare_mmdebstrap_keep_tarball = 1;
+push @{$unshare_mmdebstrap_extra_args}, "*", ["--include=auto-apt-proxy,ca-certificates,debhelper"];
+
+$clean_source = 0;
+$external_commands = {"build-failed-commands" => ["%SBUILD_SHELL"]};
+$log_dir="$HOME/logs";
+$run_autopkgtest = 1;
+$run_lintian = 1;
+# required for https://documentation.ubuntu.com/project/MIR/main-inclusion-review/
+$lintian_opts = ["-L", ">=pedantic", "--show-overrides"];
+
+# *** VERIFY AND UPDATE $mailto and $maintainer_name BELOW ***
+
+# Name to use as override in .changes files for the Maintainer: field
+#$maintainer_name='felipe.reyes@canonical.com <felipe.reyes@canonical.com@localhost>';
+
+# Directory for chroot symlinks and sbuild logs.  Defaults to the
+# current directory if unspecified.
+#$build_dir='/home/felipe.reyes@canonical.com/ubuntu/build';
+
+# Directory for writing build logs to
+$log_dir=glob("~/ubuntu/logs");
+
+#$unshare_tmpdir_template = "$ENV{HOME}/.cache/sbuild-tmp/tmp.sbuild.XXXXXXXXXX";
+$unshare_tmpdir_template = "/tmp/tmp.sbuild.XXXXXXXXXX";
+
+# don't remove this, Perl needs it:
+1;

@@ -49,3 +49,6 @@ rm -f "${APT_FILE_DEVEL_CACHE}/sources/"*.sources
 sed "s/@DEVEL@/${DEVEL_CODENAME}/g" \
   "${SCRIPT_DIR}/configs/apt-file/devel.sources" \
   > "${APT_FILE_DEVEL_CACHE}/sources/${DEVEL_CODENAME}.sources"
+
+install -m 644 "${SCRIPT_DIR}/configs/sbuildrc" "${HOME}/.sbuildrc"
+echo "Installed ~/.sbuildrc"
