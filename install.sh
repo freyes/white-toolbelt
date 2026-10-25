@@ -52,3 +52,14 @@ sed "s/@DEVEL@/${DEVEL_CODENAME}/g" \
 
 install -m 644 "${SCRIPT_DIR}/configs/sbuildrc" "${HOME}/.sbuildrc"
 echo "Installed ~/.sbuildrc"
+
+SYSTEM_SLEEP_DIR="/usr/lib/systemd/system-sleep"
+echo "sudo is required to install lxd-pause-instances as a systemd-sleep hook"
+echo "in ${SYSTEM_SLEEP_DIR} (root-owned), so LXD instances are paused on"
+echo "suspend and resumed on wake."
+# Invalidate the sudo session record on exit (including on failure) so the
+# credentials are not cached after this script finishes.
+trap 'sudo -k' EXIT
+sudo -k install -m 0755 -o root -g root "${BIN_DIR}/lxd-pause-instances" \
+  "${SYSTEM_SLEEP_DIR}/lxd-pause-instances"
+echo "Installed ${SYSTEM_SLEEP_DIR}/lxd-pause-instances"

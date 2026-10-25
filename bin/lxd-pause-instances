@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# systemd-sleep hook: pause running LXD instances (containers and VMs) before
+# the system sleeps and resume them afterwards.
+#
+# Install:  sudo install -m 0755 lxd-pause-instances /usr/lib/systemd/system-sleep/
+# Logs:     journalctl -t lxd-sleep-hook
+#
+# systemd calls hooks as: <hook> pre|post suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+# Only instances this hook paused are resumed; instances that were already
+# FROZEN before sleep are left alone.
+set -uo pipefail
+
+TAG=lxd-sleep-hook
+LXC=${LXC:-/snap/bin/lxc}
+STATE_DIR=${STATE_DIR:-/run/lxd-sleep-hook}   # tmpfs: survives sleep, not reboot
+STATE_FILE=$STATE_DIR/paused
+CMD_TIMEOUT=${CMD_TIMEOUT:-30}
+export HOME=${HOME:-/root}                      # the snap lxc client needs HOME
+
+log() {
+    local prio=$1; shift
+    logger -t "$TAG" -p "daemon.$prio" -- "$*"
+}
+
+run_lxc() {
+    local out rc=0
+    out=$(timeout "$CMD_TIMEOUT" "$LXC" "$@" 2>&1) || rc=$?
+    if (( rc != 0 )); then
+        (( rc == 124 )) && out="timed out after ${CMD_TIMEOUT}s"
+        log err "lxc $* failed (rc=$rc): $out"
+    fi
+    return "$rc"
+}
+
+instance_state() {   # project name -> RUNNING|FROZEN|STOPPED|...
+    timeout "$CMD_TIMEOUT" "$LXC" list --project "$1" -f csv -c s "^${2}\$" 2>/dev/null
+}
+
+pause_all() {
+    local listing project name state type paused=0 failed=0
+    mkdir -p "$STATE_DIR"
+    if [[ -s $STATE_FILE ]]; then
+        log warning "state file $STATE_FILE already has $(wc -l <"$STATE_FILE") entries from a previous cycle; keeping them"
+    fi
+
+    if ! listing=$(timeout "$CMD_TIMEOUT" "$LXC" list --all-projects -f csv -c e,n,s,t 2>&1); then
+        log err "cannot list LXD instances, nothing paused: $listing"
+        return 0
+    fi
+
+    while IFS=, read -r project name state type; do
+        [[ -n $name && $state == RUNNING ]] || continue
+        if run_lxc pause "$name" --project "$project"; then
+            printf '%s %s\n' "$project" "$name" >>"$STATE_FILE"
+            log info "paused $type $project/$name"
+            (( paused++ ))
+        else
+            (( failed++ ))
+        fi
+    done <<<"$listing"
+
+    log notice "pre-$ACTION: paused $paused instance(s), $failed failure(s)"
+}
+
+resume_all() {
+    local project name state resumed=0 failed=0 skipped=0
+    if [[ ! -s $STATE_FILE ]]; then
+        log info "post-$ACTION: no instances were paused by this hook"
+        return 0
+    fi
+
+    while read -r project name; do
+        [[ -n $name ]] || continue
+        state=$(instance_state "$project" "$name")
+        if [[ $state != FROZEN ]]; then
+            log warning "skipping $project/$name: state is '${state:-missing}', not FROZEN"
+            (( skipped++ ))
+            continue
+        fi
+        if run_lxc start "$name" --project "$project"; then
+            log info "resumed $project/$name"
+            (( resumed++ ))
+        else
+            (( failed++ ))
+        fi
+    done < <(sort -u "$STATE_FILE")
+
+    rm -f "$STATE_FILE"
+    log notice "post-$ACTION: resumed $resumed instance(s), $skipped skipped, $failed failure(s)"
+}
+
+PHASE=${1:-}
+ACTION=${2:-unknown}
+
+if [[ ! -x $LXC ]]; then
+    log warning "lxc client not found at $LXC, doing nothing"
+    exit 0
+fi
+
+case $PHASE in
+    pre)  pause_all ;;
+    post) resume_all ;;
+    *)    log err "unexpected arguments: $*"; exit 0 ;;
+esac
+
+# Never fail the hook: a non-zero exit must not block suspend/resume.
+exit 0
