@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 white-toolbelt contributors
+
+set -euo pipefail
+
+print_usage() {
+	cat <<'EOF'
+Usage: use-openrouter [-p|--print] [--] COMMAND [ARGS...]
+
+Runs COMMAND with the OpenRouter environment set up, or prints the
+environment when --print is given (for eval).
+
+Options:
+	-p, --print	Print export lines instead of running a command.
+	-h, --help	Show this help text.
+
+The API key is fetched from the secret service with:
+	secret-tool lookup service openrouter
+Store it first with:
+	secret-tool store --label='OpenRouter API key' service openrouter
+
+Environment set:
+	OPENROUTER_API_KEY	OpenRouter API key
+	OPENAI_API_KEY	Same key, for OpenAI-compatible programs
+	OPENAI_BASE_URL	https://openrouter.ai/api/v1
+EOF
+}
+
+PRINT_MODE=false
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-h|--help)
+			print_usage
+			exit 0
+			;;
+		-p|--print)
+			PRINT_MODE=true
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		*)
+			break
+			;;
+	esac
+done
+
+if $PRINT_MODE && [[ $# -gt 0 ]]; then
+	echo "Error: --print cannot be combined with a command." >&2
+	print_usage >&2
+	exit 1
+fi
+
+if ! $PRINT_MODE && [[ $# -eq 0 ]]; then
+	echo "Error: no command given." >&2
+	print_usage >&2
+	exit 1
+fi
+
+if ! command -v secret-tool >/dev/null 2>&1; then
+	echo "Error: secret-tool not found (needed to get the OpenRouter API key)." >&2
+	echo "Install it with: sudo apt install libsecret-tools" >&2
+	exit 1
+fi
+
+# secret-tool exits non-zero when no item matches or the keyring is
+# locked; fall back to an empty key and let the check below report it.
+API_KEY="$(secret-tool lookup service openrouter)" || API_KEY=""
+
+if [[ -z "${API_KEY}" ]]; then
+	echo "Error: no secret found for 'service=openrouter'." >&2
+	echo "Store the API key with:" >&2
+	echo "secret-tool store --label='OpenRouter API key' service openrouter" >&2
+	exit 1
+fi
+
+# Remember whether an OpenAI key was already set, to warn before it is
+# silently overridden in wrapper mode.
+EXISTING_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+
+export OPENROUTER_API_KEY="${API_KEY}"
+export OPENAI_API_KEY="${API_KEY}"
+export OPENAI_BASE_URL="https://openrouter.ai/api/v1"
+
+if $PRINT_MODE; then
+	printf 'export OPENROUTER_API_KEY=%q\n' "${OPENROUTER_API_KEY}"
+	printf 'export OPENAI_API_KEY=%q\n' "${OPENAI_API_KEY}"
+	printf 'export OPENAI_BASE_URL=%q\n' "${OPENAI_BASE_URL}"
+	exit 0
+fi
+
+if [[ -n "${EXISTING_OPENAI_API_KEY}" ]]; then
+	echo "Warning: OPENAI_API_KEY was already set; overriding it with the OpenRouter key." >&2
+fi
+
+exec "$@"
