@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright (C) 2026 white-toolbelt contributors
 
-.PHONY: install setup
+.PHONY: install setup test
 
 install:
 	./install.sh
+
+test:
+	uv run --with pytest --with requests -- pytest tests -v
 
 USER := $(shell whoami)
 
