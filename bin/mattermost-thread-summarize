@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+#
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 white-toolbelt contributors
+#
+# Summarize a Mattermost thread downloaded by mattermost-thread-download,
+# using an LLM served through OpenRouter.
+#
+# Input: either a mm-thread-<slug>/ directory (reads thread.md, uses
+# thread.json for metadata/truncation) or a direct path to a thread.md /
+# thread.json file.
+#
+# Zero Data Retention (ZDR) is hardcoded and non-negotiable: every request
+# carries provider.zdr: true, and the model is validated against
+# https://openrouter.ai/api/v1/endpoints/zdr before any content is sent.
+# There is deliberately no flag to disable it. Note that ZDR means no
+# routine storage after processing; OpenRouter still screens traffic in
+# flight (CSAM detection) and may retain flagged content where the law
+# requires it. Safety Retention endpoints are excluded from the eligible
+# model list, as they may retain flagged prompts.
+#
+# Dependencies (declare at the top):
+#   python3 >= 3.9
+#   litellm            LLM call abstraction  (pip install litellm)
+#   requests           HTTP client           (pip install requests)
+#
+# Authentication: OpenRouter API key from $OPENROUTER_API_KEY (only).
+# Tip: eval $(use-openrouter --print) exports it from the secret service.
+#
+# The thread content is sent to a third-party API (OpenRouter and the
+# upstream provider). A warning is printed on first use; silence it by
+# exporting MT_SUMMARIZE_ACK=1.
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+
+try:
+    import litellm
+except ImportError as e:
+    sys.exit(f"Missing dependency: {e.name}. Install with: pip install litellm")
+
+try:
+    import requests
+except ImportError as e:
+    sys.exit(f"Missing dependency: {e.name}. Install with: pip install requests")
+
+DEFAULT_MODEL = "z-ai/glm-5.3-flash"
+ZDR_ENDPOINTS_URL = "https://openrouter.ai/api/v1/endpoints/zdr"
+MAX_INPUT_CHARS = 400_000  # GLM 5.3 has a 1M-token context; stay well under
+ZDR = {"zdr": True}  # hardcoded; do not make this configurable
+
+SYSTEM_PROMPT = """\
+You summarize Mattermost threads that were exported to markdown.
+Produce, in this order:
+1. A one-paragraph TL;DR of what the thread is about.
+2. Key decisions that were made, if any.
+3. Action items, each prefixed with the @username responsible, if known.
+4. Open questions or unresolved threads of discussion.
+5. Notable links or attachments mentioned.
+Keep the original @usernames. Do not invent facts not present in the
+thread. Write in the same language the thread is written in, unless
+instructed otherwise by the user.
+"""
+
+
+def die(msg):
+    sys.exit(f"error: {msg}")
+
+
+def get_api_key():
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if key:
+        return key
+    die("no API key: set OPENROUTER_API_KEY (tip: eval \"$(use-openrouter --print)\")")
+
+
+def zdr_models():
+    """Return the set of model ids with a ZDR endpoint, excluding
+    Safety Retention endpoints (those may retain flagged prompts)."""
+    try:
+        r = requests.get(ZDR_ENDPOINTS_URL, timeout=30)
+        r.raise_for_status()
+        data = r.json()["data"]
+    except Exception as e:
+        die(f"cannot fetch the ZDR endpoint list from OpenRouter: {e}\n"
+            "ZDR enforcement cannot be verified; refusing to send anything")
+    return {ep["model_id"] for ep in data if not ep.get("safety_retention")}
+
+
+def load_thread(path):
+    """Return (thread_md, thread_dir) for a directory or file path."""
+    if os.path.isdir(path):
+        pdir = path
+        pmd = os.path.join(path, "thread.md")
+    else:
+        pdir = os.path.dirname(path) or "."
+        pmd = path
+    if not os.path.isfile(pmd):
+        die(f"no thread.md found at {pmd}")
+    with open(pmd, encoding="utf-8") as f:
+        return f.read(), pdir
+
+
+def truncate(thread_md, thread_dir, max_chars):
+    """Trim the markdown to max_chars, cutting at message boundaries
+    (the '---' separators emitted by mattermost-thread-download) and
+    preferring to keep the newest messages."""
+    if len(thread_md) <= max_chars:
+        return thread_md, 0
+    # Best effort: cut at message separators so the model sees whole
+    # messages. thread.md starts with a header block (title + metadata)
+    # before the first '---' separator; messages follow, oldest-first.
+    header, sep, body = thread_md.partition("\n\n---\n")
+    if not sep:
+        # no separators: hard cut, keep the newest tail
+        return thread_md[-max_chars:], len(thread_md) - max_chars
+    parts = body.split("\n\n---\n")
+    kept, total = [], 0
+    budget = max(max_chars - len(header), 0)
+    for part in reversed(parts):
+        cost = len(part) + 8  # separator overhead
+        if total + cost > budget and kept:
+            break
+        kept.append(part)
+        total += cost
+    kept.reverse()
+    note = (f"\n\n*(thread truncated: oldest messages omitted, "
+            f"{len(kept)} of {len(parts)} messages kept)*")
+    trimmed = (header + "\n\n---\n\n" + "\n\n---\n\n".join(kept) + note) if kept \
+        else header + "\n\n---\n\n*(all messages omitted by truncation)*"
+    cut = len(thread_md) - len(trimmed)
+    return trimmed, max(cut, 0)
+
+
+def summarize(model, thread_md, language):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": thread_md}]
+    if language:
+        messages.insert(1, {"role": "user",
+                            "content": f"Write the summary in {language}."})
+    return litellm.completion(
+        model=f"openrouter/{model}",
+        messages=messages,
+        extra_body={"provider": ZDR},
+        timeout=60,
+        num_retries=2,
+        drop_params=True,
+    )
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Summarize a downloaded Mattermost thread with an LLM "
+                    "via OpenRouter. Only Zero Data Retention models are used.")
+    ap.add_argument("path", help="mm-thread-<slug>/ directory, or a thread.md file")
+    ap.add_argument("--model", default=DEFAULT_MODEL,
+                    help=f"OpenRouter model id (default: {DEFAULT_MODEL}); "
+                         "must have a ZDR endpoint")
+    ap.add_argument("--language", help="write the summary in this language")
+    ap.add_argument("--max-input-chars", type=int, default=MAX_INPUT_CHARS,
+                    help=f"truncate input beyond this many characters "
+                         f"(default: {MAX_INPUT_CHARS})")
+    ap.add_argument("--write", action="store_true",
+                    help="also write summary.md next to thread.md")
+    ap.add_argument("--json", action="store_true",
+                    help="dump the raw API response JSON to stdout")
+    args = ap.parse_args()
+
+    key = get_api_key()
+    os.environ.setdefault("OPENROUTER_API_KEY", key)
+    os.environ["OR_APP_NAME"] = "white-toolbelt/mattermost-thread-summarize"
+
+    eligible = zdr_models()
+    if args.model not in eligible:
+        die(f"model {args.model!r} has no Zero Data Retention endpoint.\n"
+            "ZDR is mandatory for this tool; refusing to send the thread.\n"
+            "Eligible models:\n  " + "\n  ".join(sorted(eligible)))
+
+    thread_md, thread_dir = load_thread(args.path)
+    thread_md, cut = truncate(thread_md, thread_dir, args.max_input_chars)
+    if cut:
+        print(f"note: input truncated by ~{cut} characters "
+              "(oldest messages dropped)", file=sys.stderr)
+
+    if not os.environ.get("MT_SUMMARIZE_ACK"):
+        print("note: the thread content will be sent to OpenRouter "
+              "(ZDR endpoints only). Set MT_SUMMARIZE_ACK=1 to silence.",
+              file=sys.stderr)
+
+    try:
+        resp = summarize(args.model, thread_md, args.language)
+    except litellm.APIError as e:
+        die(f"OpenRouter request failed: {e}")
+
+    text = resp["choices"][0]["message"]["content"]
+    if args.json:
+        print(json.dumps(resp.model_dump(), indent=2, default=str))
+    print(text)
+    if args.write:
+        out = os.path.join(thread_dir, "summary.md")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(f"# Summary ({dt.datetime.now(dt.timezone.utc).isoformat()})\n\n"
+                    f"model: `{args.model}` (ZDR enforced)\n\n{text}\n")
+        print(f"saved {out}", file=sys.stderr)
+    usage = resp.get("usage")
+    if usage:
+        print(f"usage: {usage.get('prompt_tokens')} prompt / "
+              f"{usage.get('completion_tokens')} completion tokens",
+              file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
