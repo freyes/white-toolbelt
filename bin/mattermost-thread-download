@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+#
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 white-toolbelt contributors
+#
+# Download a Mattermost thread given a permalink to one of its messages,
+# and store it in three formats:
+#
+#   thread.md      markdown rendering (human and LLM friendly)
+#   thread.json    machine-readable (raw markdown messages, authors,
+#                   timestamps, reactions, attachments)
+#   thread.html    HTML conversion of thread.md, generated with pandoc
+#
+# Dependencies (declare at the top):
+#   python3 >= 3.9
+#   requests          HTTP client       (pip install requests)
+#   pandoc            markdown -> HTML  (apt install pandoc)
+#
+# Authentication: a Mattermost Personal Access Token (Account Settings ->
+# Security -> Personal Access Tokens), provided via one of:
+#   --token TOKEN
+#   $MATTERMOST_TOKEN or $MM_TOKEN
+#   secret-tool lookup service mattermost   (freedesktop secret service)
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+
+try:
+    import requests
+except ImportError as e:
+    sys.exit(f"Missing dependency: {e.name}. Install with: pip install requests")
+
+API = "/api/v4"
+ID_RE = re.compile(r"^[A-Za-z0-9]{8,64}$")
+SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+HTML_CSS = """\
+body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;line-height:1.5;
+max-width:52rem;margin:0 auto;padding:2rem}
+h1{font-size:1.25rem;margin:0 0 .25rem}
+hr{border:0;border-top:1px solid #eee;margin:1rem 0}
+img{max-width:100%;border-radius:6px}
+pre{background:#f6f6f6;padding:.5rem;border-radius:4px;overflow-x:auto}
+"""
+
+
+def run_pandoc(outdir, doc):
+    """Convert thread.md to thread.html with pandoc, embedding attachments."""
+    channel, team = doc["channel"], doc["team"]
+    title = (f"{channel['display_name'] or channel['name']}"
+             f"{' — ' + team['name'] if team else ''} — thread")
+    # --css suppresses pandoc's default template styles; --embed-resources
+    # inlines both the stylesheet and the images referenced by thread.md
+    with open(os.path.join(outdir, "style.css"), "w") as f:
+        f.write(HTML_CSS)
+    cmd = [
+        "pandoc", "--from", "markdown", "--to", "html5", "--standalone",
+        "--embed-resources", "--resource-path", ".",
+        "--metadata", f"pagetitle={title}",
+        "--css", "style.css",
+        "thread.md", "-o", "thread.html",
+    ]
+    try:
+        subprocess.run(cmd, cwd=outdir, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        die(f"pandoc failed: {e.stderr.strip()}")
+    finally:
+        os.unlink(os.path.join(outdir, "style.css"))
+
+
+def die(msg):
+    sys.exit(f"error: {msg}")
+
+
+def get_token(args):
+    if args.token:
+        return args.token
+    for env in ("MATTERMOST_TOKEN", "MM_TOKEN"):
+        if os.environ.get(env):
+            return os.environ[env]
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["secret-tool", "lookup", "service", "mattermost"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    die("no token: pass --token, set MATTERMOST_TOKEN, or store one with:\n"
+        "  secret-tool store --label='Mattermost token' service mattermost")
+
+
+def parse_url(url, server_override):
+    """Extract (server base URL, post id) from a Mattermost permalink."""
+    p = urllib.parse.urlparse(url)
+    if not p.netloc:
+        die(f"invalid URL: {url}")
+    # SPA permalinks keep the route in the fragment: /#/team/channel/postid
+    path = p.fragment if p.fragment.startswith("/") else p.path
+    segments = [s for s in path.split("/") if s]
+    if not segments:
+        die(f"cannot find a post id in URL: {url}")
+    post_id = segments[-1]
+    if not ID_RE.fullmatch(post_id):
+        die(f"last path component {post_id!r} does not look like a post id")
+    if server_override:
+        return server_override.rstrip("/"), post_id
+    # /<team>/<channel>/<postid>; anything before that is a base path
+    base = ""
+    if len(segments) > 3:
+        base = "/" + "/".join(segments[:-3])
+    return f"{p.scheme}://{p.netloc}{base}", post_id
+
+
+class Mattermost:
+    def __init__(self, server, token):
+        self.server = server.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "white-toolbelt/mattermost-thread-download",
+        })
+
+    def request(self, method, path, **kwargs):
+        r = self.session.request(method, self.server + API + path, timeout=30, **kwargs)
+        if not r.ok:
+            try:
+                detail = r.json().get("message", r.text[:200])
+            except Exception:
+                detail = r.text[:200]
+            die(f"API {path} failed: HTTP {r.status_code}: {detail}")
+        return r
+
+    def get_json(self, path):
+        return self.request("GET", path).json()
+
+    def get_bytes(self, path):
+        return self.request("GET", path).content
+
+    def get_json_soft(self, path):
+        """GET JSON that may legitimately 403/404; returns [] on failure."""
+        try:
+            return self.get_json(path)
+        except SystemExit:
+            return []
+
+
+def iso(ms):
+    if not ms:
+        return None
+    return dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc).isoformat()
+
+
+def display_name(user):
+    full = " ".join(n for n in (user.get("first_name"), user.get("last_name")) if n)
+    return user.get("nickname") or full or user.get("username") or user["id"]
+
+
+def fetch_thread(mm, post_id, no_attachments):
+    # Resolve the permalink target to the thread root
+    post = mm.get_json(f"/posts/{post_id}")
+    root_id = post.get("root_id") or post["id"]
+    thread = mm.get_json(f"/posts/{root_id}/thread")
+    posts = [thread["posts"][pid] for pid in reversed(thread["order"])]
+
+    users = {}
+    for p in posts:
+        users[p["user_id"]] = None
+    if users:
+        for u in mm.request("POST", "/users/ids", json=list(users)).json():
+            users[u["id"]] = u
+
+    reactions = {p["id"]: [] for p in posts}
+    for p in posts:
+        reactions[p["id"]] = mm.get_json_soft(f"/posts/{p['id']}/reactions")
+
+    root = posts[0]
+    channel = mm.get_json(f"/channels/{root['channel_id']}")
+    team = mm.get_json(f"/teams/{root['team_id']}") if root.get("team_id") else None
+
+    files = {}
+    if not no_attachments:
+        for p in posts:
+            for finfo in (p.get("metadata", {}).get("files") or []):
+                fid = finfo["id"]
+                fname = f"{fid[:12]}__{SLUG_RE.sub('_', finfo.get('name', 'attachment'))}"
+                files[fid] = {
+                    "info": finfo,
+                    "name": fname,
+                    "mime": finfo.get("mime_type", "application/octet-stream"),
+                    "data": mm.get_bytes(f"/files/{fid}"),
+                }
+    return posts, users, reactions, channel, team, files
+
+
+def build_json(source_url, fetched_at, posts, users, reactions, channel, team, files):
+    def user_ref(uid):
+        u = users.get(uid) or {}
+        return {
+            "id": uid,
+            "username": u.get("username", uid),
+            "display_name": display_name(u) if u else uid,
+        }
+
+    def file_ref(p, fid):
+        f = files.get(fid)
+        info = (f or {}).get("info") or next(
+            (fi for fi in p.get("metadata", {}).get("files", []) if fi["id"] == fid), {"id": fid})
+        return {
+            "id": fid,
+            "name": info.get("name"),
+            "mime_type": info.get("mime_type"),
+            "size_bytes": info.get("size"),
+            "local_path": f"files/{f['name']}" if f else None,
+        }
+
+    def reactions_of(pid):
+        grouped = {}
+        for r in reactions.get(pid, []):
+            grouped.setdefault(r["emoji_name"], []).append(user_ref(r["user_id"])["username"])
+        return [{"emoji": k, "count": len(v), "users": v} for k, v in grouped.items()]
+
+    return {
+        "source": {"url": source_url, "fetched_at": fetched_at},
+        "team": team and {"id": team["id"], "name": team.get("name")},
+        "channel": {"id": channel["id"], "name": channel.get("name"),
+                    "display_name": channel.get("display_name"),
+                    "type": channel.get("type")},
+        "post_count": len(posts),
+        "participants": [user_ref(uid) for uid in users if users[uid]],
+        "users": {
+            uid: {
+                "username": u.get("username"),
+                "display_name": display_name(u),
+                "first_name": u.get("first_name"),
+                "last_name": u.get("last_name"),
+                "nickname": u.get("nickname"),
+                "email": u.get("email"),
+            }
+            for uid, u in users.items() if u
+        },
+        "posts": [
+            {
+                "id": p["id"],
+                "parent_id": p.get("parent_id"),
+                "deleted": bool(p.get("delete_at")),
+                "type": p.get("type"),
+                "author": user_ref(p["user_id"]),
+                "created_at": iso(p.get("create_at")),
+                "edited_at": iso(p.get("edit_at")) or None,
+                "message": p["message"],
+                "files": [file_ref(p, fid) for fid in p.get("file_ids", [])],
+                "reactions": reactions_of(p["id"]),
+                "props": p.get("props") or {},
+            }
+            for p in posts
+        ],
+    }
+
+
+def message_markdown(post):
+    """Message body as markdown; falls back to message-attachment props."""
+    text = post["message"]
+    if not text:
+        parts = []
+        for att in (post.get("props") or {}).get("attachments") or []:
+            if att.get("pretext"):
+                parts.append(att["pretext"])
+            if att.get("title") or att.get("text"):
+                body = att.get("text", "")
+                if att.get("title"):
+                    body = f"**{att['title']}**\n{body}"
+                parts.append(body)
+        text = "\n\n".join(parts)
+    return text.strip()
+
+
+def reaction_line(reactions):
+    parts = [f"{r['emoji']} x{r['count']} ({', '.join(r['users'])})" for r in reactions]
+    return f"*Reactions: {' · '.join(parts)}*" if parts else ""
+
+
+def file_markdown(ref, files):
+    f = files.get(ref["id"])
+    if not f:
+        return f"*attachment {ref['id']} not downloaded*"
+    path = f"files/{f['name']}"
+    name = ref["name"] or f["name"]
+    if f["mime"].startswith("image/"):
+        return f"![{name}]({path})"
+    return f"[{name}]({path})"
+
+
+def build_markdown(doc, files):
+    channel, team = doc["channel"], doc["team"]
+    title = (f"{channel['display_name'] or channel['name']}"
+             f"{' — ' + team['name'] if team else ''} — thread")
+    out = [
+        f"# {title}",
+        "",
+        f"- Channel: {channel['display_name'] or channel['name']} (`{channel['name']}`)"
+        + (f", team {team['name']}" if team else ""),
+        f"- Messages: {doc['post_count']}",
+        f"- Fetched: {doc['source']['fetched_at']}",
+        f"- Source: {doc['source']['url']}",
+        "",
+        "---",
+        "",
+    ]
+    for p in doc["posts"]:
+        author = p["author"]
+        time = (p["created_at"] or "").replace("T", " ").replace("+00:00", " UTC")
+        out.append(f"**{author['display_name']}** ({author['username']}) · {time}")
+        out.append("")
+        out.append(p["message"] if not p["deleted"] else "*(message deleted)*")
+        for ref in p["files"]:
+            out.append("")
+            out.append(file_markdown(ref, files))
+        line = reaction_line(p["reactions"])
+        if line:
+            out.append("")
+            out.append(line)
+        out.append("")
+        out.append("---")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def run_pandoc(outdir, doc):
+    """Convert thread.md to thread.html with pandoc, embedding attachments."""
+    channel, team = doc["channel"], doc["team"]
+    title = (f"{channel['display_name'] or channel['name']}"
+             f"{' — ' + team['name'] if team else ''} — thread")
+    # --css suppresses pandoc's default template styles; --embed-resources
+    # inlines both the stylesheet and the images referenced by thread.md
+    with open(os.path.join(outdir, "style.css"), "w") as f:
+        f.write(HTML_CSS)
+    cmd = [
+        "pandoc", "--from", "markdown", "--to", "html5", "--standalone",
+        "--embed-resources", "--resource-path", ".",
+        "--metadata", f"pagetitle={title}",
+        "--css", "style.css",
+        "thread.md", "-o", "thread.html",
+    ]
+    try:
+        subprocess.run(cmd, cwd=outdir, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        die(f"pandoc failed: {e.stderr.strip()}")
+    finally:
+        os.unlink(os.path.join(outdir, "style.css"))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Download a Mattermost thread as markdown, HTML and JSON.")
+    ap.add_argument("url", help="URL of any message in the thread")
+    ap.add_argument("-o", "--output", default=".", help="output directory (default: .)")
+    ap.add_argument("--server", help="override server base URL, e.g. http://localhost:8065")
+    ap.add_argument("--token", help="Mattermost personal access token")
+    ap.add_argument("--no-attachments", action="store_true", help="skip file downloads")
+    args = ap.parse_args()
+
+    if not shutil.which("pandoc"):
+        die("pandoc not found; install it (apt install pandoc)")
+    server, post_id = parse_url(args.url, args.server)
+    token = get_token(args)
+    mm = Mattermost(server, token)
+    posts, users, reactions, channel, team, files = fetch_thread(mm, post_id, args.no_attachments)
+    root_id = posts[0]["id"]
+
+    slug = SLUG_RE.sub("-", f"{channel['name']}-{root_id[:12]}")
+    outdir = os.path.join(args.output, f"mm-thread-{slug}")
+    os.makedirs(outdir, exist_ok=True)
+
+    doc = build_json(args.url, dt.datetime.now(dt.timezone.utc).isoformat(),
+                     posts, users, reactions, channel, team, files)
+    with open(os.path.join(outdir, "thread.json"), "w") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    with open(os.path.join(outdir, "thread.md"), "w") as f:
+        f.write(build_markdown(doc, files))
+    if files:
+        fdir = os.path.join(outdir, "files")
+        os.makedirs(fdir, exist_ok=True)
+        for f in files.values():
+            with open(os.path.join(fdir, f["name"]), "wb") as fh:
+                fh.write(f["data"])
+    run_pandoc(outdir, doc)
+
+    print(f"Saved {len(posts)} messages to {outdir}")
+
+
+if __name__ == "__main__":
+    main()
